@@ -72,7 +72,7 @@ class WolfmemConfig:
     max_facts: int = field(default_factory=lambda: _env_int("WOLFMEM_MAX_FACTS", 800))
 
     # Observer tuning.
-    observe_interval: int = field(default_factory=lambda: _env_int("WOLFMEM_OBSERVE_INTERVAL", 300))
+    observe_interval: int = field(default_factory=lambda: _env_int("WOLFMEM_OBSERVE_INTERVAL", 3600))
     observe_min_lines: int = field(default_factory=lambda: _env_int("WOLFMEM_OBSERVE_MIN_LINES", 3))
     observe_max_lines: int = field(default_factory=lambda: _env_int("WOLFMEM_OBSERVE_MAX_LINES", 60))
 
