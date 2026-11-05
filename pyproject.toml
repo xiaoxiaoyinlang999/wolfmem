@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wolfmem"
+version = "0.1.0"
+description = "Persistent memory for AI agents and IDEs: daily journal, a background observer that distills facts via LLM, and a vector-backed fact store exposed over MCP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Silver Wolf (xiaoxiaoyinlang999)" }]
+keywords = ["memory", "mcp", "agent", "llm", "vector", "journal"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = ["aiohttp>=3.9"]
+
+[project.scripts]
+wolfmem = "wolfmem.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/xiaoxiaoyinlang999/wolfmem"
+
+[tool.setuptools.packages.find]
+where = ["src"]
