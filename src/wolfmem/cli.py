@@ -15,14 +15,14 @@ from .observer import Observer
 from .store import FactStore
 
 
-def _build(config: WolfmemConfig | None = None) -> tuple[WolfmemConfig, Journal, FactStore, Observer]:
+def _build(config: WolfmemConfig | None = None):
     config = config or WolfmemConfig()
     config.ensure_dirs()
     journal = Journal(config.journal_dir)
     embeddings = EmbeddingClient(config)
     store = FactStore(config, embeddings)
     observer = Observer(config, journal, store)
-    return config, journal, store, observer
+    return config, journal, embeddings, store, observer
 
 
 def _print(value) -> None:
@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         WolfmemMcpServer().serve()
         return 0
 
-    config, journal, store, observer = _build()
+    config, journal, embeddings, store, observer = _build()
 
     if args.command == "init":
         _print({"home": str(config.home), "embedding": embeddings.available})

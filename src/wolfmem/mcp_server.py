@@ -209,6 +209,14 @@ class WolfmemMcpServer:
             stream=sys.stderr, level=logging.INFO,
             format="[wolfmem] %(levelname)s %(message)s",
         )
+        # Start the observer loop in a daemon thread so `wolfmem serve` is
+        # the full automatic pipeline, not just on-demand tools. Without an
+        # LLM key the loop scans harmlessly and skips distillation.
+        # Honesty note: the observer only sees what lands in the journal —
+        # hosts that want conversation memory must journal_write their turns.
+        from .observer import start_observer_background
+
+        start_observer_background(self.config, self.journal, self.store)
         for line in sys.stdin:
             line = line.strip()
             if not line:

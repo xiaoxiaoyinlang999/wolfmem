@@ -78,6 +78,18 @@ class FactStore:
         overlap = len(q & t) / len(q)
         return round(min(1.0, overlap * 2.0), 3)  # half-overlap ~= strong hit
 
+    async def _embed_safe(self, text: str) -> Optional[list[float]]:
+        """Embed with degradation: endpoint errors fall back to keyword mode.
+
+        Returns ``None`` when embeddings are unavailable or fail; callers then
+        write keyword-mode rows (empty ``emb``) instead of losing the fact.
+        Rows without vectors still participate in recall via keyword scoring.
+        """
+        try:
+            return await self.embeddings.embed(text)
+        except Exception:  # noqa: BLE001 - degraded write beats failed write
+            return None
+
     # ---------------- write ----------------
 
     async def remember(self, text: str, importance: int = 3) -> dict:
@@ -88,7 +100,7 @@ class FactStore:
         text = (text or "").strip()
         if not text:
             return {"ok": False, "reason": "empty text"}
-        vec = await self.embeddings.embed(text)
+        vec = await self._embed_safe(text)
         conn = self._db()
         try:
             if vec is not None:
@@ -98,9 +110,12 @@ class FactStore:
                     except (ValueError, TypeError):
                         continue
                     if EmbeddingClient.cosine(vec, old) >= self.config.dedupe_score:
+                        # Update the vector together with the text: keeping a
+                        # stale embedding would make recall match the old
+                        # wording while the UI shows the new one.
                         conn.execute(
-                            "UPDATE facts SET text = ?, last_hit = ?, importance = MAX(importance, ?) WHERE id = ?",
-                            (text, time.time(), importance, row["id"]),
+                            "UPDATE facts SET text = ?, emb = ?, last_hit = ?, importance = MAX(importance, ?) WHERE id = ?",
+                            (text, json.dumps(vec), time.time(), importance, row["id"]),
                         )
                         conn.commit()
                         return {"ok": True, "action": "updated", "id": row["id"]}
@@ -131,7 +146,7 @@ class FactStore:
         if not query:
             return []
         top = top or self.config.recall_top
-        vec = await self.embeddings.embed(query)
+        vec = await self._embed_safe(query)
         conn = self._db()
         try:
             rows = conn.execute("SELECT * FROM facts").fetchall()
@@ -141,9 +156,19 @@ class FactStore:
         if vec is not None:
             scored: list[tuple[float, sqlite3.Row]] = []
             for row in rows:
+                kw = self._keyword_score(query, row["text"])
+                if not row["emb"]:
+                    # Facts written in keyword mode stay recallable after the
+                    # embedding service is switched on — fused scoring keeps
+                    # the offline→online migration path lossless.
+                    if kw > 0:
+                        scored.append((kw, row))
+                    continue
                 try:
                     old = json.loads(row["emb"])
                 except (ValueError, TypeError):
+                    if kw > 0:
+                        scored.append((kw, row))
                     continue
                 score = EmbeddingClient.cosine(vec, old)
                 if score >= self.config.min_score:

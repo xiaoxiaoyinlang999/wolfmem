@@ -234,6 +234,27 @@ wolfmem forget "[坑]"                            # forget by tag/keyword/id
 | `observe_once` | — | run one observer scan immediately |
 | `stats` | — | counts by needle tag, embedding availability |
 
+## Privacy & boundaries
+
+Read this before deploying with real conversations:
+
+- **Local storage ≠ fully local processing.** The observer sends journal
+  text to your configured LLM endpoint; the embedding client sends the text
+  it encodes. Pick providers you trust and scope your compliance to that.
+- **`forget` clears facts, not the journal.** The append-only ledger is
+  ground truth and is not rewritten by design. If you need a true deletion
+  path, delete the JSONL files under `journal/` yourself and run
+  `observe_once` with a fresh `observe_state.json`.
+- **Single-user by design (v0.1).** There is no per-user/project isolation in
+  the fact store: one `WOLFMEM_HOME` means one shared memory. Run separate
+  homes for separate projects; scoping is on the roadmap.
+- **MCP stdio is synchronous and serial** (one request at a time, protocol
+  version pinned to `2024-11-05`). This matches the single-user CLI profile;
+  high-concurrency hosting needs its own gateway.
+- **`wolfmem serve` runs the observer loop in a daemon thread**, but the
+  observer only sees what lands in the journal — hosts that want
+  conversation memory must call `journal_write` for their turns.
+
 ## Design decisions
 
 - **SQLite over a vector DB.** At ≤ a few thousand facts, brute-force cosine

@@ -8,8 +8,12 @@ deployment, generalized:
    retroactively distilled, which keeps costs predictable.
 3. Only complete lines are consumed; a partially flushed line waits for the
    next tick.
-4. Fact extraction runs on the caller's loop with a hard HTTP timeout; a hung
-   endpoint wastes one tick at most, never the loop.
+4. The byte offset is committed ONLY after a batch is fully processed:
+   fewer than ``min_lines`` worthy turns → nothing consumed (next tick
+   accumulates), distiller failure → nothing consumed (next tick retries).
+   A scan therefore cannot silently drop turns.
+5. Fact extraction runs with a hard HTTP timeout; a hung endpoint wastes one
+   tick at most, never the loop.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +47,27 @@ def _observation_worthy(text: str) -> bool:
     if re.fullmatch(r"[\W_0-9]+", text):
         return False  # punctuation-only / emoji lines
     return True
+
+
+def _parse_facts_array(raw: str) -> list:
+    """Tolerant JSON-array extraction.
+
+    Chat models love decorating their JSON with prose ("好的，以下是提炼结果：").
+    ``json.loads`` on the whole blob fails with "Extra data"; instead, locate
+    the first ``[`` and let ``JSONDecoder.raw_decode`` stop at the array's end.
+    """
+    raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except ValueError:
+        pass
+    start = raw.find("[")
+    if start < 0:
+        raise ValueError(f"no JSON array in distiller reply: {raw[:120]!r}")
+    parsed, _ = json.JSONDecoder().raw_decode(raw[start:])
+    return parsed
 
 
 class Observer:
@@ -70,9 +96,15 @@ class Observer:
     # ---------------- scan ----------------
 
     async def observe_once(self) -> dict:
-        """Scan for new journal turns; distill and store when enough gathered."""
-        new_records: list[dict] = []
-        changed = False
+        """Scan for new journal turns; distill and store when enough gathered.
+
+        Offset semantics: the offset advances only when a batch is fully
+        consumed (distilled AND stored). Under-filled or failed batches stay
+        pending and are re-read next tick.
+        """
+        # 1) Discover candidate turns without committing progress.
+        candidates: list[tuple[str, int, dict]] = []  # (file, end_offset_of_line, record)
+        pending_files: list[str] = []
         for path in self.journal.files(last_n=3):
             name = path.name
             try:
@@ -83,49 +115,75 @@ class Observer:
             if offset is None:
                 # First sighting: start from the tail, never re-read history.
                 self._offsets[name] = size
-                changed = True
+                pending_files.append(name)
                 continue
             if size <= offset:
                 continue
             with open(path, "rb") as f:
                 f.seek(offset)
                 blob = f.read()
-            cut = blob.rfind(b"\n")
-            if cut < 0:
-                continue  # incomplete line; wait for the next tick
-            self._offsets[name] = offset + cut + 1
-            changed = True
-            for raw in blob[: cut + 1].splitlines():
+            pos = 0
+            for raw in blob.splitlines(keepends=True):
+                cut = offset + len(raw)
+                if not raw.endswith(b"\n"):
+                    break  # incomplete line; wait for the next tick
+                pos = cut
                 try:
                     rec = json.loads(raw.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     continue
                 if isinstance(rec, dict) and _observation_worthy(str(rec.get("text", ""))):
-                    new_records.append(rec)
-        if changed:
+                    candidates.append((name, cut, rec))
+            pending_files.append(name)
+
+        # First-sight state changes are safe to persist immediately: they
+        # carry no unprocessed content.
+        if self._offsets:
             self._save_state()
 
-        if len(new_records) < self.config.observe_min_lines:
-            return {"new_lines": len(new_records), "facts": 0, "skipped": "not enough lines"}
+        worthy = len(candidates)
+        if worthy < self.config.observe_min_lines:
+            # Commit nothing. Next tick re-reads the same bytes and the count
+            # accumulates instead of silently dropping these turns.
+            return {
+                "new_lines": worthy,
+                "facts": 0,
+                "skipped": "not enough lines (offsets left pending)",
+            }
 
-        recent = new_records[-self.config.observe_max_lines:]
-        transcript = self.journal.transcript(recent)
+        # 2) Distill the most recent batch. On failure, offsets stay put and
+        # the whole batch is retried next tick.
+        recent = candidates[-self.config.observe_max_lines:]
+        transcript = self.journal.transcript(rec[2] for rec in recent)
         try:
             facts = await self._distill(transcript)
-        except Exception as exc:  # noqa: BLE001 - one bad LLM reply must not kill the loop
-            return {"new_lines": len(new_records), "facts": 0, "error": repr(exc)}
+        except Exception as exc:  # noqa: BLE001 - retried next tick, never fatal
+            return {"new_lines": worthy, "facts": 0, "error": repr(exc)}
 
+        # 3) Store facts. Any store failure also leaves offsets pending.
         saved = 0
-        for fact in facts:
-            text = str(fact).strip()
-            if not (6 <= len(text) <= 160):
-                continue
-            try:
+        try:
+            for fact in facts:
+                text = str(fact).strip()
+                if not (6 <= len(text) <= 160):
+                    continue
                 await self.store.remember(text, importance=2)
                 saved += 1
-            except Exception as exc:  # noqa: BLE001 - one bad fact must not stop the batch
-                logger.debug("store failed for fact %r: %s", text[:40], exc)
-        return {"new_lines": len(new_records), "facts": saved}
+        except Exception as exc:  # noqa: BLE001
+            return {"new_lines": worthy, "facts": saved, "error": repr(exc)}
+
+        # 4) Full success: commit progress to the end of the scanned region.
+        # Turns beyond the transcript window are treated as overflow and
+        # consumed together with the batch — the observer looks at the recent
+        # past, not the whole backlog.
+        for name in pending_files:
+            last_end = max(
+                (cut for fname, cut, _ in candidates if fname == name),
+                default=self._offsets.get(name, 0),
+            )
+            self._offsets[name] = last_end
+        self._save_state()
+        return {"new_lines": worthy, "facts": saved}
 
     # ---------------- distill ----------------
 
@@ -161,31 +219,6 @@ class Observer:
             raise ValueError("distiller returned non-list JSON")
         return [x for x in parsed if isinstance(x, str)]
 
-    @staticmethod
-    def _parse_facts(raw: str) -> list:  # pragma: no cover - kept for API symmetry
-        return _parse_facts_array(raw)
-
-
-def _parse_facts_array(raw: str) -> list:
-    """Tolerant JSON-array extraction.
-
-    Chat models love decorating their JSON with prose ("好的，以下是提炼结果：").
-    ``json.loads`` on the whole blob fails with "Extra data"; instead, locate
-    the first ``[`` and let ``JSONDecoder.raw_decode`` stop at the array's end.
-    """
-    raw = raw.strip()
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-    except ValueError:
-        pass
-    start = raw.find("[")
-    if start < 0:
-        raise ValueError(f"no JSON array in distiller reply: {raw[:120]!r}")
-    parsed, _ = json.JSONDecoder().raw_decode(raw[start:])
-    return parsed
-
     # ---------------- loop ----------------
 
     async def run_forever(self) -> None:
@@ -193,7 +226,7 @@ def _parse_facts_array(raw: str) -> list:
         while True:
             try:
                 result = await self.observe_once()
-                if result.get("facts"):
+                if result.get("facts") or result.get("error"):
                     logger.info("observer: %s", result)
             except asyncio.CancelledError:
                 raise
@@ -204,11 +237,17 @@ def _parse_facts_array(raw: str) -> list:
 
 def start_observer_background(
     config: WolfmemConfig, journal: Journal, store: FactStore
-) -> Optional[asyncio.Task]:
-    """Best-effort background task for hosts that already run an event loop."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    observer = Observer(config, journal, store)
-    return loop.create_task(observer.run_forever())
+) -> Optional[threading.Thread]:
+    """Start the observer loop in a daemon thread.
+
+    The MCP stdio server is synchronous and single-threaded by protocol, so
+    the loop runs its own asyncio event loop in the background. Daemon=True:
+    the server's lifetime bounds the observer's, and stderr keeps the logs.
+    """
+    def _run() -> None:
+        observer = Observer(config, journal, store)
+        asyncio.run(observer.run_forever())
+
+    thread = threading.Thread(target=_run, name="wolfmem-observer", daemon=True)
+    thread.start()
+    return thread
