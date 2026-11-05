@@ -5,6 +5,8 @@ conversation ledger, a background observer distills it into durable facts with
 an LLM, and a vector-backed SQLite store recalls them — exposed over MCP so
 Claude Code, Cursor, Cline, Zed or your own agent can plug in with one line.
 
+English | [简体中文](README.zh-CN.md)
+
 ```text
 pip install wolfmem        # then:
 wolfmem serve              # MCP server on stdio — that's it
